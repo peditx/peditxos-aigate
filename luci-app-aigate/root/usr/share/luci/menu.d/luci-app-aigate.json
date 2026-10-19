@@ -1,0 +1,114 @@
+{
+	"admin/ai": {
+		"title": "AI",
+		"order": 50,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/ai/aigate": {
+		"title": "AiGate",
+		"order": 20,
+		"action": {
+			"type": "firstchild"
+		}
+	},
+	"admin/ai/aigate/main": {
+		"title": "Gateway",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "aigate/main"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-aigate"
+			]
+		}
+	},
+	"admin/ai/aigate/providers": {
+		"title": "Providers",
+		"order": 2,
+		"action": {
+			"type": "view",
+			"path": "aigate/providers"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-aigate"
+			]
+		}
+	},
+	"admin/ai/aigate/accounts": {
+		"title": "Accounts",
+		"order": 3,
+		"action": {
+			"type": "view",
+			"path": "aigate/accounts"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-aigate"
+			]
+		}
+	},
+	"admin/ai/aigate/combos": {
+		"title": "Combos",
+		"order": 4,
+		"action": {
+			"type": "view",
+			"path": "aigate/combos"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-aigate"
+			]
+		}
+	},
+	"admin/ai/aigate/logs": {
+		"title": "Runtime Logs",
+		"order": 999,
+		"action": {
+			"type": "view",
+			"path": "aigate/logs"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-aigate"
+			]
+		}
+	},
+	"admin/ai/aigate/provider_config": {
+		"action": {
+			"type": "view",
+			"path": "aigate/provider_config"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-aigate"
+			]
+		}
+	},
+	"admin/ai/aigate/account_config": {
+		"action": {
+			"type": "view",
+			"path": "aigate/account_config"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-aigate"
+			]
+		}
+	},
+	"admin/ai/aigate/combo_config": {
+		"action": {
+			"type": "view",
+			"path": "aigate/combo_config"
+		},
+		"depends": {
+			"acl": [
+				"luci-app-aigate"
+			]
+		}
+	}
+}

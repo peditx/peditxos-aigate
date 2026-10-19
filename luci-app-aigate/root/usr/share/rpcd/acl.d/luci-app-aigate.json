@@ -1,0 +1,36 @@
+{
+	"luci-app-aigate": {
+		"description": "PeDItXOS-AiGate AI gateway control",
+		"read": {
+			"ubus": {
+				"rc": [
+					"list"
+				]
+			},
+			"uci": [
+				"aigate"
+			],
+			"file": {
+				"/usr/lib/aigate/VERSION": [
+					"read"
+				],
+				"/tmp/aigate-update.log": [
+					"read"
+				],
+				"/usr/share/aigate/providers.json": [
+					"read"
+				]
+			}
+		},
+		"write": {
+			"ubus": {
+				"rc": [
+					"init"
+				]
+			},
+			"uci": [
+				"aigate"
+			]
+		}
+	}
+}

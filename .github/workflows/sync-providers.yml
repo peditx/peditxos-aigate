@@ -1,0 +1,27 @@
+name: Sync providers from 9Router upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # every Monday 06:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch registry and regenerate providers.json
+        run: sh scripts/sync-providers.sh
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add luci-app-aigate/root/usr/share/aigate/providers.json
+          if git diff --cached --quiet; then
+            echo "providers.json already up to date"
+          else
+            git commit -m "sync: providers.json from decolua/9router @ $(date -u +%Y-%m-%d)"
+            git push
+          fi
