@@ -424,6 +424,20 @@ local function a2o_req(b, pr)
 	if nn(b.max_tokens) then o.max_tokens = b.max_tokens end
 	if nn(b.stop_sequences) then o.stop = b.stop_sequences end
 	if nn(b.user) then o.user = b.user end
+	-- thinking (anthropic client field) -> reasoning_effort (openai field)
+	if nn(b.thinking) and type(b.thinking) == 'table' then
+		local t = b.thinking
+		if t.type == 'enabled' then
+			local bt = tonumber(t.budget_tokens) or 10000
+			o.reasoning_effort = (bt >= 12000) and 'high'
+				or (bt >= 5000) and 'medium' or 'low'
+		elseif t.type == 'disabled' then
+			o.reasoning_effort = 'none'
+		end
+	elseif nn(b.reasoning_effort) then
+		o.reasoning_effort = b.reasoning_effort
+	end
+	if pr and pr.effort then o.reasoning_effort = pr.effort end
 	if nn(b.stream_options) then o.stream_options = b.stream_options end
 	if nn(b.tool_choice) then
 		local tc = b.tool_choice
@@ -517,6 +531,24 @@ local function o2a_req(b, pr)
 	if nn(b.temperature) then o.temperature = b.temperature end
 	if nn(b.top_p) then o.top_p = b.top_p end
 	if nn(b.top_k) then o.top_k = b.top_k end
+	-- reasoning_effort (openai client field) -> thinking (anthropic field)
+	if nn(b.reasoning_effort) then
+		local e = b.reasoning_effort
+		if e == 'none' then
+			o.thinking = { type = 'disabled' }
+		elseif e == 'low' or e == 'medium' or e == 'high' then
+			o.thinking = { type = 'enabled',
+				budget_tokens = (e == 'high') and 16000
+					or (e == 'medium') and 8000 or 2000 }
+		end
+	elseif nn(b.thinking) and type(b.thinking) == 'table' then
+		o.thinking = b.thinking
+	end
+	if pr and pr.thinking == 'on' then
+		o.thinking = { type = 'enabled', budget_tokens = 10000 }
+	elseif pr and pr.thinking == 'off' then
+		o.thinking = { type = 'disabled' }
+	end
 	if nn(b.stop) then
 		o.stop_sequences = (type(b.stop) == 'table') and b.stop or { b.stop }
 	end
@@ -861,6 +893,134 @@ local function require_auth()
 	return true
 end
 
+
+-- ================= quota / oauth / logging =================
+local QUOTA_DIR = '/tmp/aigate-quota'
+local OAUTH_DIR = '/tmp/aigate-oauth'
+local LOG_FILE = '/root/.aigate/requests.log'
+
+local function today()
+	return os.date('%Y-%m-%d')
+end
+
+local function quota_read(acct_name)
+	local f = io.open(QUOTA_DIR .. '/' .. acct_name .. '_' .. today(), 'r')
+	if not f then return 0 end
+	local v = tonumber(f:read('*a')) or 0
+	f:close()
+	return v
+end
+
+local function quota_add(acct_name, n)
+	os.execute('mkdir -p ' .. sq(QUOTA_DIR) .. ' 2>/dev/null')
+	local cur = quota_read(acct_name) + n
+	local f = io.open(QUOTA_DIR .. '/' .. acct_name .. '_' .. today(), 'w')
+	if f then f:write(tostring(cur)); f:close() end
+end
+
+local function log_request(entry)
+	os.execute('mkdir -p ' .. sq(LOG_FILE:match('^(.*)/') or '/root/.aigate') .. ' 2>/dev/null')
+	local f = io.open(LOG_FILE, 'a')
+	if f then
+		entry.time = os.date('%Y-%m-%dT%H:%M:%S')
+		f:write(json.encode(entry) .. '\n')
+		f:close()
+	end
+end
+
+local function http_post_json(url, body, extra_headers)
+	local bodyf = os.tmpname()
+	local bf = io.open(bodyf, 'w')
+	if bf then bf:write(body); bf:close() end
+	local hdrs = {}
+	if extra_headers then
+		for _, h in ipairs(extra_headers) do hdrs[#hdrs+1] = '-H ' .. sq(h) end
+	end
+	local cmd = table.concat({
+		'curl -sS --connect-timeout 10 --max-time 30', '-D -',
+		table.concat(hdrs, ' '),
+		'-H ' .. sq('content-type: application/json'),
+		'--data-binary @' .. sq(bodyf), sq(url), '2>/dev/null',
+	}, ' ')
+	local ph = io.popen(cmd, 'r')
+	local out = {}
+	if ph then
+		for line in ph:lines() do out[#out+1] = line:gsub('\r$', '') end
+		ph:close()
+	end
+	os.remove(bodyf)
+	return table.concat(out, '\n')
+end
+
+-- OAuth: resolve a usable access_token, refreshing if needed.
+-- ac.oauth = {token_url, client_id, refresh_token, scope?}
+local function oauth_token(ac)
+	-- UCI fields are flat: oauth_token_url / oauth_client_id / oauth_refresh_token
+	local token_url, refresh_token, client_id =
+		ac.oauth_token_url, ac.oauth_refresh_token, ac.oauth_client_id
+	if not token_url or token_url == '' or not refresh_token or refresh_token == '' then
+		return nil
+	end
+	ac.oauth = { token_url = token_url, refresh_token = refresh_token,
+		client_id = client_id }
+	local cache = OAUTH_DIR .. '/' .. ac._name .. '.json'
+	local now = os.time()
+	local cf = io.open(cache, 'r')
+	if cf then
+		local ok, cached = pcall(json.decode, cf:read('*a') or '')
+		cf:close()
+		if ok and type(cached) == 'table' and cached.access_token
+			and (cached.expires_at or 0) > now + 30 then
+			return cached.access_token
+		end
+	end
+	local req = json.encode({
+		grant_type = 'refresh_token',
+		refresh_token = ac.oauth.refresh_token,
+		client_id = ac.oauth.client_id,
+	})
+	local resp = http_post_json(ac.oauth.token_url, req, nil)
+	local body = resp:match('\n\n(.*)$') or resp
+	local ok, tok = pcall(json.decode, body)
+	if ok and type(tok) == 'table' and tok.access_token then
+		os.execute('mkdir -p ' .. sq(OAUTH_DIR) .. ' 2>/dev/null')
+		local f = io.open(cache, 'w')
+		if f then
+			f:write(json.encode({
+				access_token = tok.access_token,
+				expires_at = now + (tonumber(tok.expires_in) or 3600),
+			}))
+			f:close()
+		end
+		return tok.access_token
+	end
+	return nil
+end
+
+-- resolve effective auth header for an account (oauth > api_key)
+local function ac_auth_header(ac, dialect)
+	local tok = oauth_token(ac)
+	if tok then
+		if dialect == 'anthropic' then
+			return 'Authorization: Bearer ' .. tok
+		end
+		return 'Authorization: Bearer ' .. tok
+	end
+	if dialect == 'anthropic' then
+		return 'x-api-key: ' .. (ac.api_key or '')
+	end
+	return 'Authorization: Bearer ' .. (ac.api_key or '')
+end
+
+local function account_skipped(ac)
+	-- daily token limit
+	local lim = tonumber(ac.daily_limit)
+	if lim and lim > 0 and quota_read(ac._name) >= lim then
+		return 'quota_exceeded'
+	end
+	return nil
+end
+
 -- ================= provider chain =================
 local function chain(client_dialect)
 	local clen = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
@@ -894,9 +1054,14 @@ local function chain(client_dialect)
 	end
 	local last = 'no provider'
 
+	local t_start = os.time()
 	for _, cand in ipairs(cands) do
 		local pr, ac = cand.pr, cand.ac
 		do
+			local skipped = account_skipped(ac)
+			if skipped then
+				last = pr._name .. '/' .. ac._name .. ' -> ' .. skipped
+			else
 			b.model = nn(ac.model) and ac.model or orig_model
 
 			local up = pr.type
@@ -923,11 +1088,12 @@ local function chain(client_dialect)
 
 				local base = pr.base_url:gsub('/+$', '')
 				local hdrs = {}
+				hdrs[#hdrs + 1] = '-H ' .. sq(ac_auth_header(ac, up))
 				if up == 'anthropic' then
-					hdrs[#hdrs + 1] = '-H ' .. sq('x-api-key: ' .. ac.api_key)
 					hdrs[#hdrs + 1] = '-H ' .. sq('anthropic-version: 2023-06-01')
-				else
-					hdrs[#hdrs + 1] = '-H ' .. sq('Authorization: Bearer ' .. ac.api_key)
+					if ac.cache == '1' then
+						hdrs[#hdrs + 1] = '-H ' .. sq('anthropic-beta: prompt-caching-2024-07-31')
+					end
 				end
 				-- extra provider headers (UCI option headers: 'A: 1|B: 2')
 				if nn(pr.headers) then
@@ -970,32 +1136,110 @@ local function chain(client_dialect)
 				if ph and not eof and status and status >= 200 and status < 300 then
 					local stream_wanted = (b.stream == true)
 					local translated = (up ~= client_dialect)
+					local tag = pr._name .. '/' .. ac._name
 
-					if not translated then
+					-- helper: was this payload actually usable? (9router: HTTP200 with
+					-- zero usable content must fall through to the next account)
+					local function usable_json(resp)
+						if type(resp) ~= 'table' then return false end
+						if resp.error then return false end
+						local ch = resp.choices and resp.choices[1]
+						if ch then
+							local m = ch.message
+							if (nn(ch.text) and ch.text ~= '')
+								or (m and ((nn(m.content) and m.content ~= '')
+									or nn(m.tool_calls))) then
+								return true
+							end
+							if nn(ch.finish_reason) or nn(ch.delta) then return true end
+						end
+						if resp.content and #resp.content > 0 then return true end
+						if resp.type == 'message' or resp.object == 'chat.completion'
+							or resp.object == 'chat.completion.chunk' then
+							return true
+						end
+						return false
+					end
+
+					local function done_ok()
+						-- accounting + audit log (best-effort)
+						local usage = nil
+						if type(_G.__last_usage) == 'table' then usage = _G.__last_usage end
+						if usage then
+							local toks = (tonumber(usage.prompt_tokens)
+								or tonumber(usage.input_tokens) or 0)
+								+ (tonumber(usage.completion_tokens)
+								or tonumber(usage.output_tokens) or 0)
+							if toks > 0 then quota_add(ac._name, toks) end
+						end
+						log_request({
+							model = tostring(orig_model),
+							provider = pr._name, account = ac._name,
+							dialect = up, client = client_dialect,
+							translated = translated, stream = stream_wanted,
+							status = 200, usage = usage,
+							elapsed = os.time() - t_start,
+						})
+					end
+
+					if not translated and not stream_wanted then
+						-- buffer non-stream passthrough: verify content + capture usage
+						local all = ph:read('*a') or ''
+						ph:close()
+						local okr, resp = pcall(json.decode, all)
+						if not okr or not usable_json(resp) then
+							last = tag .. (okr and ' -> empty 200 body' or ' -> bad JSON')
+							os.remove(bodyf)
+							goto continue
+						end
+						_G.__last_usage = (type(resp) == 'table') and resp.usage or nil
 						emit('Status: 200 OK\r\nContent-Type: '
 							.. (ctype or 'application/json') .. '\r\n')
 						emit('Cache-Control: no-cache\r\n\r\n')
-						while true do
-							local l = ph:read('*l')
-							if not l then break end
-							emit(l:gsub('\r$', '') .. '\n')
-						end
-						ph:close(); os.remove(bodyf)
+						emit(all:gsub('\r$', '') .. '\n')
+						done_ok()
+						os.remove(bodyf)
 						return true
 					end
 
 					if stream_wanted then
-						emit('Status: 200 OK\r\nContent-Type: text/event-stream\r\n')
+						-- peek the FIRST line before committing headers, so an empty
+						-- 200 can still fall through to the next account
+						local xf = translated and ((up == 'anthropic')
+							and a2o_stream() or o2a_stream()) or nil
+						local first, pre = nil, nil
+						while true do
+							first = ph:read('*l')
+							if not first then break end
+							first = first:gsub('\r$', '')
+							if first ~= '' then
+								if xf then pre = xf.line(first) else pre = first end
+								break
+							end
+							if xf then local o = xf.line(''); if nn(o) and o ~= '' then pre = o break end end
+						end
+						if not first and not pre then
+							last = tag .. ' -> empty 200 stream'
+							ph:read('*a'); ph:close()
+							os.remove(bodyf)
+							goto continue
+						end
+						emit('Status: 200 OK\r\nContent-Type: '
+							.. (translated and 'text/event-stream' or (ctype or 'text/event-stream'))
+							.. '\r\n')
 						emit('Cache-Control: no-cache\r\n\r\n')
-						local xf = (up == 'anthropic') and a2o_stream() or o2a_stream()
+						if nn(pre) and pre ~= '' then emit(pre) end
 						while true do
 							local l = ph:read('*l')
 							if not l then break end
-							local o = xf.line(l:gsub('\r$', ''))
+							local o = xf and xf.line(l:gsub('\r$', '')) or (l:gsub('\r$', '') .. '\n')
 							if nn(o) and o ~= '' then emit(o) end
 						end
-						local tail = xf.finish()
-						if nn(tail) and tail ~= '' then emit(tail) end
+						if xf then
+							local tail = xf.finish()
+							if nn(tail) and tail ~= '' then emit(tail) end
+						end
+						done_ok()
 						ph:close(); os.remove(bodyf)
 						return true
 					end
@@ -1006,17 +1250,20 @@ local function chain(client_dialect)
 					local okr, resp = pcall(json.decode, all)
 					if okr and type(resp) == 'table' then
 						local okx, out = pcall(up == 'anthropic' and a2o_resp or o2a_resp, resp)
-						if okx and type(out) == 'table' then
+						if okx and type(out) == 'table' and usable_json(resp) then
+							_G.__last_usage = out.usage or nil
 							emit('Status: 200 OK\r\nContent-Type: application/json\r\n\r\n')
 							emit(json.encode(out) .. '\n')
+							done_ok()
 							os.remove(bodyf)
 							return true
 						end
-						last = pr._name .. '/' .. ac._name .. ' -> response translate failed'
+						last = tag .. ' -> empty/unusable translated response'
 					else
-						last = pr._name .. '/' .. ac._name .. ' -> bad upstream JSON'
+						last = tag .. ' -> bad upstream JSON'
 					end
 					os.remove(bodyf)
+					goto continue
 				else
 					last = pr._name .. '/' .. ac._name .. ' -> HTTP '
 						.. (status and tostring(status) or 'curl-fail')
@@ -1026,9 +1273,9 @@ local function chain(client_dialect)
 					end
 					os.remove(bodyf)
 				end
-			else
-				-- nothing sent; just try next provider
-			end
+			end -- if not skip
+			end -- if not account_skipped
+			::continue::
 		end
 	end
 

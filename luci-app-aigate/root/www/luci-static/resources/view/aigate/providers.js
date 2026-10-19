@@ -2,6 +2,7 @@
 'require view';
 'require uci';
 'require ui';
+'require fs';
 
 var CSS = [
 	':root, [data-theme="dark"] {',
@@ -68,6 +69,7 @@ return view.extend({
 	},
 
 	render: function() {
+		var self = this;
 		var rows = uci.sections('aigate', 'provider');
 		var trs = rows.map(function(s) {
 			return E('tr', {}, [
@@ -94,6 +96,7 @@ return view.extend({
 			E('tr', {}, [ E('td', { 'colspan': 5, 'class': 'hint' },
 				'No providers yet. Each provider = one upstream endpoint (dialect + base URL).') ]) ];
 
+		this.notice = E('div', { 'class': 'msg' });
 		return E([ E('style', { 'type': 'text/css' }, CSS), themeSwitch(),
 			E('div', { 'class': 'peditx-app' }, [
 			E('div', { 'class': 'card' }, [
@@ -107,8 +110,50 @@ return view.extend({
 					E('tr', {}, [ 'name', 'dialect', 'base_url', 'models', '' ].map(function(h) {
 						return E('th', {}, h);
 					}))
-				].concat(body))
+				].concat(body)),
+				this.notice
 			])
 		]) ]);
+	},
+
+	show: function(text, err) {
+		var el = this.notice;
+		el.textContent = text;
+		el.className = 'msg ' + (err ? 'err' : 'ok');
+	},
+
+	runTool: function(bin, arg, btn) {
+		var self = this;
+		if (btn) btn.disabled = true;
+		this.show('Running ' + bin + ' ...', false);
+		return fs.exec_direct('/usr/sbin/' + bin, [arg]).then(function(out) {
+			if (btn) btn.disabled = false;
+			self.show(String(out || '(no output)').trim(), /"ok":true|\w/.test(String(out)) ? false : true);
+		}).catch(function(err) {
+			if (btn) btn.disabled = false;
+			self.show('Failed: ' + err, true);
+		});
+	},
+
+	fetchModels: function(prov, btn) {
+		var self = this;
+		if (btn) btn.disabled = true;
+		this.show('Fetching models for ' + prov + ' ...', false);
+		return fs.exec_direct('/usr/sbin/aigate-fetch-models', [prov]).then(function(out) {
+			if (btn) btn.disabled = false;
+			var ids = String(out || '').trim().replace(/\s+/g, '');
+			if (!ids || ids === 'FETCH_FAILED') {
+				self.show('Fetch failed — check key/base_url (Validate first).', true);
+				return;
+			}
+			uci.set('aigate', prov, 'models', ids);
+			return uci.save().then(function() { return uci.commit('aigate'); }).then(function() {
+				self.show('Saved ' + ids.split(',').length + ' models to ' + prov + '. Reloading...', false);
+				setTimeout(function() { window.location.reload(); }, 900);
+			});
+		}).catch(function(err) {
+			if (btn) btn.disabled = false;
+			self.show('Failed: ' + err, true);
+		});
 	}
 });

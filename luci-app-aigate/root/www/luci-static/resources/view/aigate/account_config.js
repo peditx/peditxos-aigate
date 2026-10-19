@@ -2,6 +2,7 @@
 'require view';
 'require uci';
 'require ui';
+'require fs';
 
 var CSS = [
 	':root, [data-theme="dark"] {',
@@ -98,6 +99,26 @@ return view.extend({
 		var prioEl = E('input', { 'class': 't', 'type': 'text', 'value': sec.priority || '0' });
 		var modelEl = E('input', { 'class': 't', 'type': 'text', 'value': sec.model || '' });
 		var maxtokEl = E('input', { 'class': 't', 'type': 'text', 'value': sec.max_tokens || '' });
+		var thinkEl = E('select', { 'class': 't' }, [
+			E('option', { 'value': '', 'selected': !sec.thinking ? 'selected' : null }, 'inherited (client decides)'),
+			E('option', { 'value': 'on', 'selected': sec.thinking === 'on' ? 'selected' : null }, 'force thinking ON'),
+			E('option', { 'value': 'off', 'selected': sec.thinking === 'off' ? 'selected' : null }, 'force thinking OFF')
+		]);
+		var effortEl = E('select', { 'class': 't' }, [
+			E('option', { 'value': '', 'selected': !sec.effort ? 'selected' : null }, 'inherited (client decides)'),
+			E('option', { 'value': 'none', 'selected': sec.effort === 'none' ? 'selected' : null }, 'none'),
+			E('option', { 'value': 'low', 'selected': sec.effort === 'low' ? 'selected' : null }, 'low'),
+			E('option', { 'value': 'medium', 'selected': sec.effort === 'medium' ? 'selected' : null }, 'medium'),
+			E('option', { 'value': 'high', 'selected': sec.effort === 'high' ? 'selected' : null }, 'high')
+		]);
+		var cacheEl = E('input', { 'type': 'checkbox',
+			'checked': sec.cache === '1' ? 'checked' : null });
+		var limitEl = E('input', { 'class': 't', 'type': 'text', 'value': sec.daily_limit || '' });
+		var tokUrlEl = E('input', { 'class': 't', 'type': 'text', 'value': sec.oauth_token_url || '',
+			'placeholder': 'https://auth.example.com/oauth/token' });
+		var cidEl = E('input', { 'class': 't', 'type': 'text', 'value:': sec.oauth_client_id || '',
+			'value': sec.oauth_client_id || '' });
+		var rtEl = E('input', { 'class': 't', 'type': 'password', 'value': sec.oauth_refresh_token || '' });
 
 		return E([ E('style', { 'type': 'text/css' }, CSS), themeSwitch(),
 			E('div', { 'class': 'peditx-app' }, [
@@ -120,9 +141,23 @@ return view.extend({
 					'If set, requests through this account use this model name regardless of the client request.'),
 				E('label', { 'class': 'f' }, 'max_tokens default (Anthropic providers need it)'),
 				maxtokEl,
+				E('label', { 'class': 'f' }, 'Thinking (Anthropic-style reasoning)'),
+				thinkEl,
+				E('label', { 'class': 'f' }, 'Reasoning effort (OpenAI-style)'),
+				effortEl,
+				E('label', {}, [ cacheEl, ' Prompt caching (anthropic-beta header)' ]),
+				E('label', { 'class': 'f' }, 'Daily token limit (empty = unlimited; quota tracked per account/day)'),
+				limitEl,
+				E('label', { 'class': 'f' }, 'OAuth: token endpoint URL'),
+				tokUrlEl,
+				E('label', { 'class': 'f' }, 'OAuth: client_id'),
+				cidEl,
+				E('label', { 'class': 'f' }, 'OAuth: refresh token (engine auto-refreshes access tokens)'),
+				rtEl,
 				E('div', { 'style': 'margin-top:16px' }, [
 					E('button', { 'class': 'btn', 'click': ui.createHandlerFn(self, 'handleSave',
-						name, nameEl, provEl, keyEl, tierEl, prioEl, modelEl, maxtokEl) }, 'Save'),
+						name, nameEl, provEl, keyEl, tierEl, prioEl, modelEl, maxtokEl,
+						thinkEl, effortEl, cacheEl, limitEl, tokUrlEl, cidEl, rtEl) }, 'Save'),
 					E('button', { 'class': 'btn btn-secondary', 'click': function() {
 						window.location.href = L.url('admin/ai/aigate/accounts');
 					} }, 'Back')
@@ -131,7 +166,8 @@ return view.extend({
 		]) ]);
 	},
 
-	handleSave: function(oldName, nameEl, provEl, keyEl, tierEl, prioEl, modelEl, maxtokEl) {
+	handleSave: function(oldName, nameEl, provEl, keyEl, tierEl, prioEl, modelEl, maxtokEl,
+			thinkEl, effortEl, cacheEl, limitEl, tokUrlEl, cidEl, rtEl) {
 		var name = nameEl.value.trim().replace(/[^A-Za-z0-9_]/g, '');
 		if (!name) { ui.addNotification(E('p', {}, 'Name is required.')); return; }
 		var chain = Promise.resolve();
@@ -146,6 +182,13 @@ return view.extend({
 			uci.set('aigate', name, 'priority', prioEl.value.trim() || '0');
 			if (modelEl.value.trim()) uci.set('aigate', name, 'model', modelEl.value.trim());
 			if (maxtokEl.value.trim()) uci.set('aigate', name, 'max_tokens', maxtokEl.value.trim());
+			uci.set('aigate', name, 'thinking', thinkEl.value);
+			uci.set('aigate', name, 'effort', effortEl.value);
+			uci.set('aigate', name, 'cache', cacheEl.checked ? '1' : '0');
+			uci.set('aigate', name, 'daily_limit', limitEl.value.trim());
+			if (tokUrlEl.value.trim()) uci.set('aigate', name, 'oauth_token_url', tokUrlEl.value.trim());
+			if (cidEl.value.trim()) uci.set('aigate', name, 'oauth_client_id', cidEl.value.trim());
+			if (rtEl.value.trim()) uci.set('aigate', name, 'oauth_refresh_token', rtEl.value.trim());
 			return uci.save().then(function() { return uci.commit('aigate'); });
 		}).then(function() {
 			window.location.href = L.url('admin/ai/aigate/accounts');

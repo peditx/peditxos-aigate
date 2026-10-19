@@ -19,6 +19,12 @@
 				],
 				"/usr/share/aigate/providers.json": [
 					"read"
+				],
+				"/root/.aigate/requests.log": [
+					"read"
+				],
+				"/tmp/aigate-quota": [
+					"list"
 				]
 			}
 		},
@@ -30,7 +36,15 @@
 			},
 			"uci": [
 				"aigate"
-			]
+			],
+			"file": {
+				"/usr/sbin/aigate-validate": [
+					"exec"
+				],
+				"/usr/sbin/aigate-fetch-models": [
+					"exec"
+				]
+			}
 		}
 	}
 }

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Validate a provider's API key against its endpoint. Prints one JSON line.
+# Usage: aigate-validate <provider-section>
+set -eu
+PROV="${1:?provider section required}"
+BASE=$(uci -q get "aigate.$PROV.base_url" || true)
+[ -n "$BASE" ] || { echo '{"ok":false,"error":"unknown provider"}'; exit 0; }
+TYPE=$(uci -q get "aigate.$PROV.type" || echo openai)
+KEY=""
+for ac in $(uci show aigate | sed -n "s/^aigate\.\([a-zA-Z0-9_]*\)\.provider='$PROV'.*/\1/p"); do
+	KEY=$(uci -q get "aigate.$ac.api_key" || true)
+	[ -n "$KEY" ] && break
+done
+BASE="${BASE%/}"
+if [ "$TYPE" = "anthropic" ]; then
+	HDR=$(printf 'x-api-key: %s\nanthropic-version: 2023-06-01' "${KEY:-none}")
+else
+	HDR=$(printf 'Authorization: Bearer %s' "${KEY:-none}")
+fi
+CODE=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 \
+	-H "$HDR" "$BASE/models" 2>/dev/null || echo 000)
+if [ "$CODE" = "000" ]; then
+	CODE=$(curl -sS -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 20 \
+		-H "$HDR" "$BASE" 2>/dev/null || echo 000)
+fi
+case "$CODE" in
+	200|204) echo "{\"ok\":true,\"status\":\"$CODE\"}" ;;
+	401|403) echo "{\"ok\":false,\"status\":\"$CODE\",\"error\":\"key rejected\"}" ;;
+	404)     echo "{\"ok\":false,\"status\":\"$CODE\",\"error\":\"endpoint not found (check base_url)\"}" ;;
+	000)     echo "{\"ok\":false,\"status\":\"000\",\"error\":\"unreachable\"}" ;;
+	*)       echo "{\"ok\":false,\"status\":\"$CODE\"}" ;;
+esac

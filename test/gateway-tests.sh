@@ -61,6 +61,22 @@ class H(BaseHTTPRequestHandler):
         if authz.startswith("Bearer "): key = authz[7:]
         model = body.get("model", "")
         stream = body.get("stream") is True
+        if MODE == "empty":
+            # 200 with zero usable content (9router's "HTTP 200 empty" case)
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Connection", "close")
+                self.end_headers(); self.close_connection = True
+                return
+            self._json(200, {})
+            return
+        # thinking / reasoning translation guards
+        if model == "think-test":
+            if self.path.endswith("/chat/completions") and "reasoning_effort" not in body:
+                self._json(400, {"error": {"message": "reasoning_effort not translated"}}); return
+            if self.path.endswith("/messages") and "thinking" not in body:
+                self._json(400, {"error": {"message": "thinking not translated"}}); return
 
         if self.path.endswith("/messages"):
             # anthropic dialect; enforce the one field anthropic requires
@@ -239,9 +255,41 @@ aigate.acc_side.provider='prov_side'
 aigate.acc_side.api_key='kside'
 EOF
 
+cat > "$T/config-empty.txt" <<'EOF'
+aigate.main.api_key=''
+aigate.prov_e1.type='anthropic'
+aigate.prov_e1.base_url='http://127.0.0.1:18082/v1'
+aigate.acc_e1.provider='prov_e1'
+aigate.acc_e1.api_key='ke1'
+aigate.prov_e2.type='anthropic'
+aigate.prov_e2.base_url='http://127.0.0.1:18080/v1'
+aigate.acc_e2.provider='prov_e2'
+aigate.acc_e2.api_key='ke2'
+aigate.acc_e2.models=''
+aigate.prov_e2.models='claude-sse'
+EOF
+
+cat > "$T/config-think.txt" <<'EOF'
+aigate.main.api_key=''
+aigate.prov_th.type='openai'
+aigate.prov_th.base_url='http://127.0.0.1:18080/v1'
+aigate.acc_th.provider='prov_th'
+aigate.acc_th.api_key='kth'
+EOF
+
+cat > "$T/config-quota.txt" <<'EOF'
+aigate.main.api_key=''
+aigate.prov_q.type='anthropic'
+aigate.prov_q.base_url='http://127.0.0.1:18080/v1'
+aigate.acc_q.provider='prov_q'
+aigate.acc_q.api_key='kq'
+aigate.acc_q.daily_limit='100'
+EOF
+
 python3 "$T/mock.py" sse 18080 & MOCK1=$!
 python3 "$T/mock.py" fail 18081 & MOCK2=$!
-trap 'kill $MOCK1 $MOCK2 2>/dev/null; rm -rf "$T"' EXIT
+python3 "$T/mock.py" empty 18082 & MOCK3=$!
+trap 'kill $MOCK1 $MOCK2 ${MOCK3:-} 2>/dev/null; rm -rf "$T"' EXIT
 sleep 0.5
 
 run() { # run <outfile> <method> <uri> <body> [auth] [cfg]
@@ -352,6 +400,30 @@ IB='{"model":"img-v1","prompt":"a cat"}'
 run "$T/t20.out" POST "/v1/images/generations" "$IB" "" "$T/config-side.txt"
 check "T20 200" "$T/t20.out" "Status: 200"
 check "T20 data" "$T/t20.out" 'img.png'
+
+echo "== T25: HTTP-200-with-empty-body falls through to next account =="
+EB2='{"model":"claude-sse","stream":false,"max_tokens":50,"messages":[{"role":"user","content":"x"}]}'
+run "$T/t25.out" POST "/v1/messages" "$EB2" "" "$T/config-empty.txt"
+check "T25 got real content via fallback" "$T/t25.out" "Hi back"
+if grep -q '"content":\s*"Hi back"' "$T/t25.out" || grep -q 'Hi back' "$T/t25.out"; then
+  ok "T25 skipped empty provider (e1) and used e2"
+else
+  bad "T25 fallback content"
+fi
+
+echo "== T26: thinking (Anthropic) translated to reasoning_effort (OpenAI) =="
+TB='{"model":"think-test","stream":false,"max_tokens":50,"thinking":{"type":"enabled","budget_tokens":8000},"messages":[{"role":"user","content":"x"}]}'
+run "$T/t26.out" POST "/v1/messages" "$TB" "" "$T/config-think.txt"
+check "T26 translated (upstream accepted)" "$T/t26.out" "Status: 200"
+check "T26 body went through" "$T/t26.out" "Yo back"
+
+echo "== T27: daily quota skips exhausted account =="
+mkdir -p /tmp/aigate-quota
+echo "999999" > "/tmp/aigate-quota/acc_q_$(date +%Y-%m-%d)"
+QB='{"model":"claude-sse","stream":false,"max_tokens":50,"messages":[{"role":"user","content":"x"}]}'
+run "$T/t27.out" POST "/v1/messages" "$QB" "" "$T/config-quota.txt"
+check "T27 502 quota" "$T/t27.out" "quota_exceeded"
+rm -f "/tmp/aigate-quota/acc_q_$(date +%Y-%m-%d)"
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"

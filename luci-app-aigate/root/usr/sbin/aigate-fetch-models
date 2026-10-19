@@ -1,0 +1,23 @@
+#!/bin/sh
+# Fetch a provider's model list as comma-separated ids (LuCI button).
+# Usage: aigate-fetch-models <provider>
+set -eu
+PROV="${1:?provider section required}"
+BASE=$(uci -q get "aigate.$PROV.base_url" || true)
+[ -n "$BASE" ] || { echo "FETCH_FAILED"; exit 0; }
+TYPE=$(uci -q get "aigate.$PROV.type" || echo openai)
+KEY=""
+for ac in $(uci show aigate | sed -n "s/^aigate\.\([a-zA-Z0-9_]*\)\.provider='$PROV'.*/\1/p"); do
+	KEY=$(uci -q get "aigate.$ac.api_key" || true)
+	[ -n "$KEY" ] && break
+done
+BASE="${BASE%/}"
+if [ "$TYPE" = "anthropic" ]; then
+	HDR=$(printf 'x-api-key: %s\nanthropic-version: 2023-06-01' "${KEY:-none}")
+else
+	HDR=$(printf 'Authorization: Bearer %s' "${KEY:-none}")
+fi
+OUT=$(curl -sS --connect-timeout 10 --max-time 30 -H "$HDR" "$BASE/models" 2>/dev/null || true)
+printf '%s' "$OUT" | tr ',' '\n' | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+	| sort -u | tr '\n' ',' | sed 's/,$//'
+echo ""

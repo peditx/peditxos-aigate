@@ -4,6 +4,7 @@
 'require ui';
 
 var LOG_PATH = '/tmp/aigate-update.log';
+var REQ_LOG = '/root/.aigate/requests.log';
 
 var CSS = [
 	':root, [data-theme="dark"] {',
@@ -48,33 +49,58 @@ function themeSwitch() {
 
 return view.extend({
 	load: function() {
-		return fs.read_direct(LOG_PATH, 'text').catch(function() { return '(no update log yet)'; });
+		return Promise.all([
+			fs.read_direct(REQ_LOG, 'text').catch(function() { return ''; }),
+			fs.read_direct(LOG_PATH, 'text').catch(function() { return ''; })
+		]);
 	},
 
 	render: function(data) {
 		var self = this;
-		this.logEl = E('pre', { 'class': 'log-box' }, String(data || ''));
+		this.reqEl = E('pre', { 'class': 'log-box' }, self.fmtReqs(String(data[0] || '')));
+		this.updEl = E('pre', { 'class': 'log-box' }, String(data[1] || '(no update log yet)'));
 
 		return E([ E('style', { 'type': 'text/css' }, CSS), themeSwitch(),
 			E('div', { 'class': 'peditx-app' }, [
 				E('div', { 'class': 'card' }, [
-					E('h3', {}, 'Runtime Logs'),
-					E('div', { 'class': 'hint' },
-						'Update log below. Service errors: logread -e uhttpd (stderr of the gateway CGI).'),
-					E('div', { 'style': 'margin:10px 0' }, [
+					E('h3', {}, 'Request Log (live quota: quota is enforced per account/day)'),
+					E('div', { 'style': 'margin-bottom:10px' }, [
 						E('button', { 'class': 'btn',
 							'click': ui.createHandlerFn(self, 'handleRefresh') }, 'Refresh')
 					]),
-					this.logEl
+					this.reqEl
+				]),
+				E('div', { 'class': 'card' }, [
+					E('h3', {}, 'Update Log'),
+					this.updEl
 				])
 			]) ]);
 	},
 
+	fmtReqs: function(text) {
+		var lines = text.trim().split('\n').filter(Boolean);
+		if (!lines.length) return '(no requests yet — they appear here as clients use the gateway)';
+		return lines.slice(-200).reverse().map(function(l) {
+			var o = null;
+			try { o = JSON.parse(l); } catch (e) { return l; }
+			if (!o) return l;
+			var u = o.usage ? ((o.usage.prompt_tokens || o.usage.input_tokens || 0)
+				+ '/' + (o.usage.completion_tokens || o.usage.output_tokens || 0)) : '-';
+			return (o.time || '') + '  ' + (o.status || '')
+				+ '  ' + (o.provider || '?') + '/' + (o.account || '?')
+				+ '  model=' + (o.model || '?')
+				+ (o.translated ? ' [translated]' : '')
+				+ (o.stream ? ' [stream]' : '')
+				+ '  tok=' + u
+				+ '  ' + (o.elapsed || 0) + 's';
+		}).join('\n');
+	},
+
 	handleRefresh: function() {
 		var self = this;
-		return fs.read_direct(LOG_PATH, 'text').catch(function() { return '(no update log yet)'; })
+		return fs.read_direct(REQ_LOG, 'text').catch(function() { return ''; })
 			.then(function(text) {
-				self.logEl.textContent = String(text);
+				self.reqEl.textContent = self.fmtReqs(String(text));
 			});
 	}
 });
