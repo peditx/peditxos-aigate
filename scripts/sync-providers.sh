@@ -74,7 +74,26 @@ data['ollama-local'] = {'type': 'openai', 'url': 'http://<host>:11434/v1',
     'embeddings': False, 'images': False, 'tts': False, 'stt': False,
     'search': False, 'auth': 'none', 'display': 'Ollama (local)'}
 data['custom'] = None
+# media service presets (hand-curated: 9router's media registry has no
+# chat-transport shape to scrape — formats live in our engine translators)
+media = {
+ 'search': {
+  'tavily': {'url': 'https://api.tavily.com', 'display': 'Tavily', 'format': 'tavily'},
+  'exa': {'url': 'https://api.exa.ai', 'display': 'Exa', 'format': 'exa'},
+  'serper': {'url': 'https://google.serper.dev', 'display': 'Serper', 'format': 'serper'},
+  'brave': {'url': 'https://api.search.brave.com', 'display': 'Brave Search', 'format': 'brave'},
+  'searxng': {'url': 'https://searx.be', 'display': 'SearXNG (public instance)', 'format': 'searxng'},
+ },
+ 'fetch': {
+  'jina': {'url': 'https://r.jina.ai', 'display': 'Jina Reader', 'format': 'jina'},
+  'firecrawl': {'url': 'https://api.firecrawl.dev/v1', 'display': 'Firecrawl', 'format': 'firecrawl'},
+ },
+ 'tts': {
+  'elevenlabs': {'url': 'https://api.elevenlabs.io/v1', 'display': 'ElevenLabs', 'format': 'elevenlabs'},
+ },
+}
 doc = {'_generated': 'from decolua/9router open-sse registry — do not edit, run scripts/sync-providers.sh',
+       'media': media,
        'providers': dict(sorted(data.items()))}
 os.makedirs(os.path.dirname(out), exist_ok=True)
 with open(out, 'w') as f:

@@ -116,9 +116,11 @@ return view.extend({
 		var limitEl = E('input', { 'class': 't', 'type': 'text', 'value': sec.daily_limit || '' });
 		var tokUrlEl = E('input', { 'class': 't', 'type': 'text', 'value': sec.oauth_token_url || '',
 			'placeholder': 'https://auth.example.com/oauth/token' });
-		var cidEl = E('input', { 'class': 't', 'type': 'text', 'value:': sec.oauth_client_id || '',
+		var cidEl = E('input', { 'class': 't', 'type': 'text',
 			'value': sec.oauth_client_id || '' });
 		var rtEl = E('input', { 'class': 't', 'type': 'password', 'value': sec.oauth_refresh_token || '' });
+		var voiceEl = E('input', { 'class': 't', 'type': 'text', 'value': sec.voice || '',
+			'placeholder': '21m00Tcm4TlvDq8ikWAM (Rachel)' });
 
 		return E([ E('style', { 'type': 'text/css' }, CSS), themeSwitch(),
 			E('div', { 'class': 'peditx-app' }, [
@@ -141,6 +143,10 @@ return view.extend({
 					'If set, requests through this account use this model name regardless of the client request.'),
 				E('label', { 'class': 'f' }, 'max_tokens default (Anthropic providers need it)'),
 				maxtokEl,
+				E('label', { 'class': 'f' }, 'TTS voice id (ElevenLabs; optional)'),
+				voiceEl,
+				E('div', { 'class': 'hint' },
+					'Voice id used for ElevenLabs text-to-speech through this account. Empty = Rachel.'),
 				E('label', { 'class': 'f' }, 'Thinking (Anthropic-style reasoning)'),
 				thinkEl,
 				E('label', { 'class': 'f' }, 'Reasoning effort (OpenAI-style)'),
@@ -156,7 +162,7 @@ return view.extend({
 				rtEl,
 				E('div', { 'style': 'margin-top:16px' }, [
 					E('button', { 'class': 'btn', 'click': ui.createHandlerFn(self, 'handleSave',
-						name, nameEl, provEl, keyEl, tierEl, prioEl, modelEl, maxtokEl,
+						name, nameEl, provEl, keyEl, tierEl, prioEl, modelEl, maxtokEl, voiceEl,
 						thinkEl, effortEl, cacheEl, limitEl, tokUrlEl, cidEl, rtEl) }, 'Save'),
 					E('button', { 'class': 'btn btn-secondary', 'click': function() {
 						window.location.href = L.url('admin/ai/aigate/accounts');
@@ -167,7 +173,7 @@ return view.extend({
 	},
 
 	handleSave: function(oldName, nameEl, provEl, keyEl, tierEl, prioEl, modelEl, maxtokEl,
-			thinkEl, effortEl, cacheEl, limitEl, tokUrlEl, cidEl, rtEl) {
+			voiceEl, thinkEl, effortEl, cacheEl, limitEl, tokUrlEl, cidEl, rtEl) {
 		var name = nameEl.value.trim().replace(/[^A-Za-z0-9_]/g, '');
 		if (!name) { ui.addNotification(E('p', {}, 'Name is required.')); return; }
 		var chain = Promise.resolve();
@@ -182,6 +188,7 @@ return view.extend({
 			uci.set('aigate', name, 'priority', prioEl.value.trim() || '0');
 			if (modelEl.value.trim()) uci.set('aigate', name, 'model', modelEl.value.trim());
 			if (maxtokEl.value.trim()) uci.set('aigate', name, 'max_tokens', maxtokEl.value.trim());
+			if (voiceEl && voiceEl.value.trim()) uci.set('aigate', name, 'voice', voiceEl.value.trim());
 			uci.set('aigate', name, 'thinking', thinkEl.value);
 			uci.set('aigate', name, 'effort', effortEl.value);
 			uci.set('aigate', name, 'cache', cacheEl.checked ? '1' : '0');

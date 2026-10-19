@@ -1284,20 +1284,39 @@ local function chain(client_dialect)
 end
 
 -- ================= side endpoints (embeddings / images) =================
-local function chain_side(suffix, capflag)
+-- ================= media layer =================
+local function urlenc(v)
+	return (tostring(v):gsub('[^%w%.%-_~]', function(c)
+		return string.format('%%%02X', c:byte())
+	end))
+end
+
+-- chain_raw: byte-safe passthrough for media responses (binary audio,
+-- multipart requests, embeddings/images JSON). Forwards the CLIENT's own
+-- content-type upstream and the UPSTREAM's content-type downstream —
+-- no line splitting anywhere (that corrupts audio/multipart).
+local function chain_raw(suffix, capflag)
 	local clen = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
 	local body = (clen > 0 and io.read(clen)) or ''
+	local client_ct = os.getenv('CONTENT_TYPE') or 'application/json'
 	local last = 'no provider'
 	for _, pr in ipairs(cfg.providers) do
 		if pr.enabled ~= '0' and pr.type == 'openai' and pr.base_url
 			and pr[capflag] == '1' then
 			for _, ac in ipairs(cfg.accounts) do
 				if ac.enabled ~= '0' and ac.provider == pr._name
-					and nn(ac.api_key) and ac.api_key ~= '' then
+					and nn(ac.api_key) and ac.api_key ~= ''
+					and not account_skipped(ac) then
 					local bodyf = os.tmpname()
 					local bf = io.open(bodyf, 'w')
 					if bf then bf:write(body); bf:close() end
-					local hdrs = { '-H ' .. sq('Authorization: Bearer ' .. ac.api_key) }
+					local pfmt = pr[capflag .. '_format'] or pr.media_format
+					local hdrs = {}
+					if pfmt == 'elevenlabs' then
+						hdrs[#hdrs + 1] = '-H ' .. sq('xi-api-key: ' .. ac.api_key)
+					else
+						hdrs[#hdrs + 1] = '-H ' .. sq('Authorization: Bearer ' .. ac.api_key)
+					end
 					if nn(pr.headers) then
 						for h in pr.headers:gmatch('[^|]+') do
 							h = h:match('^%s*(.-)%s*$')
@@ -1305,41 +1324,61 @@ local function chain_side(suffix, capflag)
 						end
 					end
 					local base = pr.base_url:gsub('/+$', '')
+					local path = suffix
+					if pfmt == 'elevenlabs' then
+						-- elevenlabs default voice = Rachel; override via account 'voice'
+						local voice = ac.voice or '21m00Tcm4TlvDq8ikWAM'
+						path = '/text-to-speech/' .. urlenc(voice)
+					end
 					local cmd = table.concat({
-						'curl -sS -N --connect-timeout 15 --max-time 600',
+						'curl -sS -N --connect-timeout 15 --max-time 300',
 						'-D -', table.concat(hdrs, ' '),
-						'-H ' .. sq('content-type: application/json'),
+						'-H ' .. sq('content-type: ' .. client_ct),
 						'--data-binary @' .. sq(bodyf),
-						sq(base .. suffix), '2>/dev/null',
+						sq(base .. path), '2>/dev/null',
 					}, ' ')
 					local ph = io.popen(cmd, 'r')
+					-- header block (byte-exact): collect raw until \r\n\r\n via *a split
+					local headbuf = ''
 					local status, eof = nil, false
 					if ph then
-						repeat
-							status = nil
-							while true do
-								local l = ph:read('*l')
-								if not l then eof = true; break end
-								l = l:gsub('\r$', '')
-								if l == '' then break end
-								local c = l:match('^HTTP/[%d%.]+ (%d+)')
-								if c then status = tonumber(c) end
-							end
-						until eof or status ~= 100
-					end
-					if ph and not eof and status and status >= 200 and status < 300 then
-						emit('Status: 200 OK\r\nContent-Type: application/json\r\n\r\n')
-						while true do
-							local l = ph:read('*l')
-							if not l then break end
-							emit(l:gsub('\r$', '') .. '\n')
+						local chunk = ph:read(4096)
+						while chunk and not headbuf:find('\r\n\r\n', 1, true) do
+							headbuf = headbuf .. chunk
+							chunk = ph:read(4096)
 						end
-						ph:close(); os.remove(bodyf)
-						return true
+						if not chunk and not headbuf:find('\r\n\r\n', 1, true) then
+							eof = true
+						end
+						-- split headers / rest
+						local h, rest
+						if headbuf:find('\r\n\r\n', 1, true) then
+							h, rest = headbuf:match('^(.-)\r\n\r\n(.*)$')
+						end
+						if h then
+							local st = h:match('^HTTP/[%d%.]+ (%d+)')
+							if st then status = tonumber(st) end
+						end
+						if ph and not eof and status and status >= 200 and status < 300 then
+							local ct = (h:match('[Cc]ontent%-[Tt]ype:%s*([^\r\n]+)') or 'application/octet-stream')
+							emit('Status: 200 OK\r\nContent-Type: ' .. ct:gsub('%s+$', '') .. '\r\n')
+							emit('Cache-Control: no-cache\r\n\r\n')
+							if rest and #rest > 0 then emit(rest) end
+							-- rest of response: raw pump (no line handling)
+							while true do
+								local more = ph:read(4096)
+								if not more then break end
+								emit(more)
+							end
+							ph:close(); os.remove(bodyf)
+							log_request({ kind = capflag, provider = pr._name, account = ac._name,
+								status = 200, raw = true, elapsed = os.time() - t_start })
+							return true
+						end
+						last = pr._name .. '/' .. ac._name .. ' -> HTTP '
+							.. (status and tostring(status) or 'curl-fail')
+						if ph then ph:read('*a'); ph:close() end
 					end
-					last = pr._name .. '/' .. ac._name .. ' -> HTTP '
-						.. (status and tostring(status) or 'curl-fail')
-					if ph then ph:read('*a'); ph:close() end
 					os.remove(bodyf)
 				end
 			end
@@ -1347,6 +1386,273 @@ local function chain_side(suffix, capflag)
 	end
 	http_error(502, 'Bad Gateway: ' .. last)
 	return false
+end
+
+-- ---- media helpers ----
+-- pick media-capable providers (flag == '1', in UCI order), with accounts
+local function media_providers(capflag, format)
+	local out = {}
+	for _, pr in ipairs(cfg.providers) do
+		if pr.enabled ~= '0' and pr.base_url and pr[capflag] == '1' then
+			local fmt = pr[capflag .. '_format'] or pr.media_format or pr.preset
+			if not format or fmt == format or format == 'auto' then
+				local acs = {}
+				for _, ac in ipairs(cfg.accounts) do
+					if ac.enabled ~= '0' and ac.provider == pr._name
+						and nn(ac.api_key) and ac.api_key ~= ''
+						and not account_skipped(ac) then
+						acs[#acs + 1] = ac
+					end
+				end
+				if #acs > 0 or capflag == 'fetch' or fmt == 'searxng' then
+					out[#out + 1] = { pr = pr, accounts = acs, fmt = fmt }
+				end
+			end
+		end
+	end
+	return out
+end
+
+-- generic media call: builds curl for a given url/headers/body (JSON or raw),
+-- returns status + response body (buffered — media responses are finite)
+local function media_call(url, hdrs, json_body, is_get)
+	local cmd, bodyf
+	if is_get then
+		cmd = table.concat({
+			'curl -sS --connect-timeout 15 --max-time 120 -D -',
+			table.concat(hdrs, ' '), sq(url), '2>/dev/null',
+		}, ' ')
+	else
+		bodyf = os.tmpname()
+		local bf = io.open(bodyf, 'w')
+		if bf then bf:write(json_body); bf:close() end
+		cmd = table.concat({
+			'curl -sS --connect-timeout 15 --max-time 120 -D -',
+			table.concat(hdrs, ' '),
+			'-H ' .. sq('content-type: application/json'),
+			'--data-binary @' .. sq(bodyf),
+			sq(url), '2>/dev/null',
+		}, ' ')
+	end
+	local ph = io.popen(cmd, 'r')
+	local raw = ph and ph:read('*a') or ''
+	if ph then ph:close() end
+	if bodyf then os.remove(bodyf) end
+	local h, resp = raw:match('^(.-)\r\n\r\n(.*)$')
+	if not h then h, resp = raw:match('^(.-)\n\n(.*)$') end
+	h = h or ''
+	local status = tonumber(h:match('^HTTP/[%d%.]+ (%d+)')) or 0
+	return status, (resp or ''), h
+end
+
+local function media_err(pr, ac, status, what)
+	return pr._name .. '/' .. (ac and ac._name or '-') .. ' -> '
+		.. what .. ' HTTP ' .. status
+end
+
+-- ================= SEARCH: canonical <-> tavily/exa/serper/searxng/brave
+local function search_side()
+	local clen = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
+	local body = (clen > 0 and io.read(clen)) or ''
+	local okb, req = pcall(json.decode, body)
+	if not okb or type(req) ~= 'table' then
+		http_error(400, 'invalid JSON body')
+		return false
+	end
+	local query = nn(req.query) and req.query or req.q
+	if not nn(query) or query == '' then
+		http_error(400, 'search needs {query: "..."}')
+		return false
+	end
+	local n = tonumber(req.num_results or req.max_results or req.count) or 8
+
+	local last = 'no search provider'
+	for _, cand in ipairs(media_providers('search')) do
+		local pr, fmt = cand.pr, cand.fmt
+		if not fmt or fmt == 'auto' then fmt = pr.preset end
+		local ac = cand.accounts[1] -- search: first enabled account
+		if not ac and fmt ~= 'searxng' then
+			last = pr._name .. ' -> no enabled search account'
+			goto next_cand
+		end
+		local base = (pr.base_url or ''):gsub('/+$', '')
+		local hdrs, body, path, is_get = {}, nil, nil, false
+
+		if fmt == 'tavily' then
+			hdrs[1] = '-H ' .. sq('Authorization: Bearer ' .. ac.api_key)
+			path, body = '/search', json.encode({ query = query, max_results = n })
+		elseif fmt == 'exa' then
+			hdrs[1] = '-H ' .. sq('Authorization: Bearer ' .. ac.api_key)
+			path, body = '/search', json.encode({ query = query, numResults = n, type = 'auto' })
+		elseif fmt == 'serper' then
+			hdrs[1] = '-H ' .. sq('X-API-KEY: ' .. ac.api_key)
+			path, body = '/search', json.encode({ q = query, num = n })
+		elseif fmt == 'brave' then
+			hdrs[1] = '-H ' .. sq('X-Subscription-Token: ' .. ac.api_key)
+			path, is_get = '/res/v1/web/search?q=' .. urlenc(query) .. '&count=' .. n, true
+		elseif fmt == 'searxng' then
+			-- self-hosted instance: no key; optional auth via pr.headers
+			path, is_get = '/search?q=' .. urlenc(query) .. '&format=json&pageno=1', true
+		else
+			last = pr._name .. ' -> unknown search_format (' .. tostring(fmt) .. ')'
+			goto next_cand
+		end
+		if nn(pr.headers) then
+			for h in pr.headers:gmatch('[^|]+') do
+				h = h:match('^%s*(.-)%s*$')
+				if h:find(':', 1, true) then hdrs[#hdrs + 1] = '-H ' .. sq(h) end
+			end
+		end
+		local status, resp = media_call(base .. path, hdrs, body or '', is_get)
+
+		if status >= 200 and status < 300 then
+			local okj, data = pcall(json.decode, resp)
+			if okj and type(data) == 'table' then
+				local out = { query = query, results = arr() }
+				local raw = {}
+				if fmt == 'tavily' or fmt == 'searxng' then raw = data.results or {}
+				elseif fmt == 'exa' then raw = data.results or {}
+				elseif fmt == 'serper' then raw = data.organic or {}
+				elseif fmt == 'brave' then raw = data.web and data.web.results or {}
+				end
+				for _, r in ipairs(raw) do
+					out.results[#out.results + 1] = {
+						title = r.title or r.name or '',
+						url = r.url or r.link or '',
+						content = r.content or r.snippet or r.text or r.description or '',
+						score = r.score or r.relevance or r.page_rank or JSONNULL,
+					}
+				end
+				emit('Status: 200 OK\r\nContent-Type: application/json\r\n\r\n')
+				emit(json.encode(out) .. '\n')
+				log_request({ kind = 'search', format = fmt, provider = pr._name,
+					status = 200, query = query, elapsed = os.time() - t_start })
+				return true
+			end
+			last = media_err(pr, ac, status, 'search bad JSON')
+		else
+			last = media_err(pr, ac, status, 'search')
+		end
+		::next_cand::
+	end
+	http_error(502, 'Search failed: ' .. last)
+	return false
+end
+
+-- ================= TTS: openai(raw) / elevenlabs(translated)
+local function tts_side()
+	-- elevenlabs needs translation; openai-compat is raw passthrough
+	local clen = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
+	local body = (clen > 0 and io.read(clen)) or ''
+	local okb, req = pcall(json.decode, body)
+	if not okb or type(req) ~= 'table' then
+		http_error(400, 'invalid JSON body')
+		return false
+	end
+	-- if no provider asks for elevenlabs, use byte-safe openai passthrough
+	for _, cand in ipairs(media_providers('tts')) do
+		local fmt = cand.fmt or cand.pr.preset
+		if fmt == 'elevenlabs' and cand.accounts[1] then
+			local pr, ac = cand.pr, cand.accounts[1]
+			local text = nn(req.input) and req.input or req.text
+			if not nn(text) then http_error(400, 'tts needs {input: "..."}') return false end
+			-- elevenlabs default voice = Rachel; client may pass req.voice
+			local voice = req.voice or ac.voice or '21m00Tcm4TlvDq8ikWAM'
+			local path = '/text-to-speech/' .. urlenc(voice)
+			local hdrs = { '-H ' .. sq('xi-api-key: ' .. ac.api_key) }
+			if nn(pr.headers) then
+				for h in pr.headers:gmatch('[^|]+') do
+					h = h:match('^%s*(.-)%s*$')
+					if h:find(':', 1, true) then hdrs[#hdrs + 1] = '-H ' .. sq(h) end
+				end
+			end
+			local status, resp = media_call((pr.base_url:gsub('/+$', '')) .. path, hdrs,
+				json.encode({ text = text, model_id = req.model or ac.tts_model or 'eleven_multilingual_v2' }), false)
+			if status >= 200 and status < 300 then
+				emit('Status: 200 OK\r\nContent-Type: audio/mpeg\r\n\r\n')
+				emit(resp) -- raw bytes (buffered by media_call)
+				log_request({ kind = 'tts', format = 'elevenlabs', provider = pr._name,
+					account = ac._name, status = 200, elapsed = os.time() - t_start })
+				return true
+			end
+			-- elevenlabs failed: fall through to openai-compatible passthrough below
+			log_request({ kind = 'tts', format = 'elevenlabs', provider = pr._name,
+				account = ac._name, status = status, elapsed = os.time() - t_start })
+		end
+	end
+	-- fallback path: openai-compatible raw passthrough
+	return chain_raw('/audio/speech', 'tts')
+end
+
+-- ================= WEB FETCH: firecrawl / jina (translators)
+local function fetch_side()
+	local clen = tonumber(os.getenv('CONTENT_LENGTH') or '0') or 0
+	local body = (clen > 0 and io.read(clen)) or ''
+	local okb, req = pcall(json.decode, body)
+	if not okb or type(req) ~= 'table' or not nn(req.url) then
+		http_error(400, 'fetch needs {url: "https://..."}')
+		return false
+	end
+	local last = 'no fetch provider'
+	for _, cand in ipairs(media_providers('fetch')) do
+		local pr, fmt = cand.pr, (cand.fmt or cand.preset)
+		if not fmt or fmt == 'auto' then fmt = pr.preset end
+		local ac = cand.accounts[1]
+		local base = pr.base_url:gsub('/+$', '')
+
+		if fmt == 'firecrawl' and ac then
+			local hdrs = { '-H ' .. sq('Authorization: Bearer ' .. ac.api_key) }
+			local status, resp = media_call(base .. '/scrape', hdrs,
+				json.encode({ url = req.url, formats = { 'markdown' } }), false)
+			if status >= 200 and status < 300 then
+				local okj, data = pcall(json.decode, resp)
+				if okj and type(data) == 'table' then
+					local md = (type(data.data) == 'table' and data.data.markdown)
+						or data.markdown or data.content or ''
+					emit('Status: 200 OK\r\nContent-Type: application/json\r\n\r\n')
+					emit(json.encode({ url = req.url, content = md,
+						success = true }) .. '\n')
+					log_request({ kind = 'fetch', format = 'firecrawl',
+						provider = pr._name, status = 200, elapsed = os.time() - t_start })
+					return true
+				end
+			end
+			last = media_err(pr, ac, status, 'fetch')
+		elseif fmt == 'jina' then
+			local hdrs = {}
+			if ac then hdrs[1] = '-H ' .. sq('Authorization: Bearer ' .. ac.api_key) end
+			hdrs[#hdrs + 1] = '-H ' .. sq('Accept: text/plain')
+			local jbase = (base == '' or base == 'https://r.jina.ai')
+				and 'https://r.jina.ai' or base
+			local status, resp = media_call(jbase .. '/' .. req.url, hdrs, '', true)
+			if status >= 200 and status < 300 then
+				emit('Status: 200 OK\r\nContent-Type: application/json\r\n\r\n')
+				emit(json.encode({ url = req.url, content = resp, success = true }) .. '\n')
+				log_request({ kind = 'fetch', format = 'jina',
+					provider = pr._name, status = 200, elapsed = os.time() - t_start })
+				return true
+			end
+			last = media_err(pr, ac, status, 'fetch')
+		else
+			last = pr._name .. ' -> unknown fetch_format'
+		end
+	end
+	http_error(502, 'Fetch failed: ' .. last)
+	return false
+end
+
+-- dispatcher: translated kinds (search/tts/fetch) vs byte-safe raw kinds
+local function media_dispatch(kind)
+	if kind == 'search' then return search_side() end
+	if kind == 'tts' then return tts_side() end
+	if kind == 'fetch' then return fetch_side() end
+	-- stt / embeddings / images / video / music / imageToText: raw passthrough
+	local suffixes = {
+		stt = '/audio/transcriptions', embeddings = '/embeddings',
+		images = '/images/generations', video = '/videos/generations',
+		music = '/audio/music', imageToText = '/images/understanding',
+	}
+	return chain_raw(suffixes[kind] or '/', kind)
 end
 
 -- ================= route =================
@@ -1361,23 +1667,23 @@ elseif path == '/v1/messages' and method == 'POST' then
 elseif path == '/v1/chat/completions' and method == 'POST' then
 	if require_auth() then chain('openai') end
 elseif path == '/v1/embeddings' and method == 'POST' then
-	if require_auth() then chain_side('/embeddings', 'embeddings') end
+	if require_auth() then media_dispatch('embeddings') end
 elseif path == '/v1/images/generations' and method == 'POST' then
-	if require_auth() then chain_side('/images/generations', 'images') end
+	if require_auth() then media_dispatch('images') end
 elseif path == '/v1/audio/speech' and method == 'POST' then
-	if require_auth() then chain_side('/audio/speech', 'tts') end
+	if require_auth() then media_dispatch('tts') end
 elseif path == '/v1/audio/transcriptions' and method == 'POST' then
-	if require_auth() then chain_side('/audio/transcriptions', 'stt') end
+	if require_auth() then media_dispatch('stt') end
 elseif path == '/v1/search' and method == 'POST' then
-	if require_auth() then chain_side('/search', 'search') end
+	if require_auth() then media_dispatch('search') end
 elseif path == '/v1/web/fetch' and method == 'POST' then
-	if require_auth() then chain_side('/web/fetch', 'fetch') end
+	if require_auth() then media_dispatch('fetch') end
 elseif path == '/v1/videos/generations' and method == 'POST' then
-	if require_auth() then chain_side('/videos/generations', 'video') end
+	if require_auth() then media_dispatch('video') end
 elseif path == '/v1/audio/music' and method == 'POST' then
-	if require_auth() then chain_side('/audio/music', 'music') end
+	if require_auth() then media_dispatch('music') end
 elseif path == '/v1/images/understanding' and method == 'POST' then
-	if require_auth() then chain_side('/images/understanding', 'imageToText') end
+	if require_auth() then media_dispatch('imageToText') end
 else
 	http_error(404, 'Not Found')
 end

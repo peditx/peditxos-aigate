@@ -1,8 +1,8 @@
 #!/bin/sh
 # ============================================================
 #  PeDItXOS-AiGate — self-contained gateway test-suite
-#  Extracts the engine EMBEDDED in install.sh (source of truth),
-#  runs it as CGI (env vars) against local mock upstreams.
+#  Runs the packaged engine (luci-app-aigate/root/usr/lib/aigate/gateway.lua,
+#  the source of truth) as CGI (env vars) against local mock upstreams.
 #  Dev-only — never installed on the router.
 #
 #  Usage:  LUA=lua5.3 sh test/gateway-tests.sh
@@ -47,12 +47,58 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(out)))
         self.end_headers(); self.wfile.write(out)
+    def _raw(self, code, data, ct):
+        self.send_response(code)
+        self.send_header("Content-Type", ct)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers(); self.wfile.write(data)
+    def _media(self, body, raw):
+        # provider-native shapes; the gateway must translate each to canonical
+        key = self.headers.get("X-Api-Key") or ""
+        authz = self.headers.get("Authorization") or ""
+        if authz.startswith("Bearer "): key = authz[7:]
+        p = self.path
+        if p.endswith("/search"):
+            if "numResults" in body:      # exa
+                self._json(200, {"results": [{"id": "e1", "title": "Exa Title",
+                    "url": "https://exa.test/1", "text": "Exa content"}]}); return
+            if "q" in body:               # serper
+                self._json(200, {"organic": [{"title": "Serper Title",
+                    "link": "https://serper.test/1", "snippet": "Serper content"}]}); return
+            self._json(200, {"query": body.get("query"), "results": [   # tavily
+                {"title": "Tavily Title", "url": "https://tavily.test/1",
+                 "content": "Tavily content", "score": 0.91}]}); return
+        if p.endswith("/scrape"):         # firecrawl
+            self._json(200, {"data": {"markdown": "# Mock Page\n\nhello from firecrawl"}});
+            return
+        if "/text-to-speech/" in p:       # elevenlabs — binary audio
+            self._raw(200, b"ID3\x00\x01MOCKAUDIO\xff\xfe", "audio/mpeg"); return
+        if p.endswith("/audio/transcriptions"):  # stt passthrough echo
+            self._json(200, {"text": "mock transcript",
+                "ct": self.headers.get("Content-Type", ""), "received_key": key}); return
+        self._json(404, {"error": {"message": "mock media: unknown " + p}})
+    def do_GET(self):
+        if MODE != "media":
+            self._json(404, {"error": {"message": "GET unsupported"}}); return
+        from urllib.parse import urlparse, parse_qs
+        u = urlparse(self.path); qs = parse_qs(u.query)
+        if u.path.startswith("/http"):    # jina: /<target-url>
+            self._raw(200, ("jina mock for " + u.path[1:]).encode(), "text/plain"); return
+        if qs.get("format") == ["json"]:  # searxng
+            self._json(200, {"results": [{"title": "Searx Title",
+                "url": "https://searx.test/1", "content": "Searx content"}]}); return
+        self._json(200, {"web": {"results": [    # brave
+            {"title": "Brave Title", "url": "https://brave.test/1",
+             "description": "Brave content"}]}}); return
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(n) if n else b""
         try:
-            body = json.loads(self.rfile.read(n) or b"{}")
+            body = json.loads(raw or b"{}")
         except Exception:
             body = {}
+        if MODE == "media":
+            self._media(body, raw); return
         if MODE == "fail":
             self._json(429, {"error": {"type": "rate_limit_error", "message": "mock 429"}})
             return
@@ -286,16 +332,40 @@ aigate.acc_q.api_key='kq'
 aigate.acc_q.daily_limit='100'
 EOF
 
+# media configs: one provider per format (first-wins chain => one at a time)
+mkmedia() { # mkmedia <file> <format> <capflag>
+  cat > "$1" <<EOF
+aigate.main.api_key=''
+aigate.prov_m.type='openai'
+aigate.prov_m.base_url='http://127.0.0.1:18083'
+aigate.prov_m.$3='1'
+aigate.prov_m.media_format='$2'
+aigate.acc_m.provider='prov_m'
+aigate.acc_m.api_key='kmedia'
+aigate.acc_m.voice='21mVoiceDefault'
+EOF
+}
+mkmedia "$T/m-tavily.txt" tavily search
+mkmedia "$T/m-serper.txt" serper search
+mkmedia "$T/m-brave.txt" brave search
+mkmedia "$T/m-searxng.txt" searxng search
+mkmedia "$T/m-jina.txt" jina fetch
+mkmedia "$T/m-firecrawl.txt" firecrawl fetch
+mkmedia "$T/m-eleven.txt" elevenlabs tts
+mkmedia "$T/m-stt.txt" openai stt
+
 python3 "$T/mock.py" sse 18080 & MOCK1=$!
 python3 "$T/mock.py" fail 18081 & MOCK2=$!
 python3 "$T/mock.py" empty 18082 & MOCK3=$!
-trap 'kill $MOCK1 $MOCK2 ${MOCK3:-} 2>/dev/null; rm -rf "$T"' EXIT
+python3 "$T/mock.py" media 18083 & MOCK4=$!
+trap 'kill $MOCK1 $MOCK2 ${MOCK3:-} ${MOCK4:-} 2>/dev/null; rm -rf "$T"' EXIT
 sleep 0.5
 
-run() { # run <outfile> <method> <uri> <body> [auth] [cfg]
+run() { # run <outfile> <method> <uri> <body> [auth] [cfg] [content-type]
   local out=$1 m=$2 uri=$3 body=${4:-} auth=${5:-} cfg=${6:-$T/config.txt}
+  local ct=${7:-application/json}
   { printf '%s' "$body" | env AIGATE_CONFIG_FILE="$cfg" \
-      REQUEST_METHOD="$m" REQUEST_URI="$uri" \
+      REQUEST_METHOD="$m" REQUEST_URI="$uri" CONTENT_TYPE="$ct" \
       CONTENT_LENGTH="${#body}" HTTP_AUTHORIZATION="$auth" \
       "$LUA" "$G"; } > "$out" 2>"$out.err"
 }
@@ -424,6 +494,48 @@ QB='{"model":"claude-sse","stream":false,"max_tokens":50,"messages":[{"role":"us
 run "$T/t27.out" POST "/v1/messages" "$QB" "" "$T/config-quota.txt"
 check "T27 502 quota" "$T/t27.out" "quota_exceeded"
 rm -f "/tmp/aigate-quota/acc_q_$(date +%Y-%m-%d)"
+
+echo "== T28: /v1/search (tavily shape -> canonical) =="
+run "$T/t28.out" POST "/v1/search" '{"query":"openwrt routers","num_results":3}' "" "$T/m-tavily.txt"
+check "T28 200" "$T/t28.out" "Status: 200"
+check "T28 canonical url" "$T/t28.out" 'https://tavily.test/1'
+check "T28 canonical content" "$T/t28.out" 'Tavily content'
+
+echo "== T29: /v1/search (serper: link/snippet -> url/content) =="
+run "$T/t29.out" POST "/v1/search" '{"query":"x"}' "" "$T/m-serper.txt"
+check "T29 url" "$T/t29.out" 'https://serper.test/1'
+check "T29 content" "$T/t29.out" 'Serper content'
+
+echo "== T30: /v1/search (brave: GET web.results.description) =="
+run "$T/t30.out" POST "/v1/search" '{"query":"x"}' "" "$T/m-brave.txt"
+check "T30 url" "$T/t30.out" 'https://brave.test/1'
+check "T30 content" "$T/t30.out" 'Brave content'
+
+echo "== T31: /v1/search (searxng: GET format=json, no key) =="
+run "$T/t31.out" POST "/v1/search" '{"query":"x"}' "" "$T/m-searxng.txt"
+check "T31 url" "$T/t31.out" 'https://searx.test/1'
+check "T31 content" "$T/t31.out" 'Searx content'
+
+echo "== T32: /v1/web/fetch (jina GET /<url>) =="
+run "$T/t32.out" POST "/v1/web/fetch" '{"url":"https://example.com/page"}' "" "$T/m-jina.txt"
+check "T32 200" "$T/t32.out" "Status: 200"
+check "T32 content" "$T/t32.out" 'jina mock for https://example.com/page'
+
+echo "== T33: /v1/web/fetch (firecrawl data.markdown) =="
+run "$T/t33.out" POST "/v1/web/fetch" '{"url":"https://example.com/x"}' "" "$T/m-firecrawl.txt"
+check "T33 markdown" "$T/t33.out" 'hello from firecrawl'
+
+echo "== T34: /v1/audio/speech (elevenlabs xi-api-key + voice path + binary) =="
+run "$T/t34.out" POST "/v1/audio/speech" '{"input":"salam","voice":"21mTEST"}' "" "$T/m-eleven.txt"
+check "T34 200" "$T/t34.out" "Status: 200"
+check "T34 audio ct" "$T/t34.out" 'Content-Type: audio/mpeg'
+check "T34 binary bytes intact" "$T/t34.out" 'MOCKAUDIO'
+
+echo "== T35: /v1/audio/transcriptions (stt multipart passthrough) =="
+run "$T/t35.out" POST "/v1/audio/transcriptions" '--BOUND' "" "$T/m-stt.txt" 'multipart/form-data; boundary=B'
+check "T35 200" "$T/t35.out" "Status: 200"
+check "T35 transcript" "$T/t35.out" 'mock transcript'
+check "T35 client content-type forwarded" "$T/t35.out" 'multipart/form-data'
 
 echo ""
 echo "RESULT: $PASS passed, $FAIL failed"

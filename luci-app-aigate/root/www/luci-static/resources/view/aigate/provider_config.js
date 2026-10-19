@@ -64,7 +64,21 @@ function themeSwitch() {
 
 
 // PRESETS loaded from /usr/share/aigate/providers.json at runtime
-var PRESETS = null;
+var PRESETS = {};   // chat providers  { id: {type,url,...} }
+var MEDIA = {};     // media presets   { search:{id:{url,format,display}}, fetch:{...}, tts:{...} }
+
+// format <select> helper: options = list of [value, label]
+function fmtSelect(opts, cur) {
+	return E('select', { 'class': 't' }, opts.map(function(o) {
+		return E('option', { 'value': o[0],
+			'selected': (cur || 'auto') === o[0] ? 'selected' : null }, o[1]);
+	}));
+}
+var SEARCH_FMTS = [['auto', 'auto (provider order)'], ['tavily', 'Tavily'], ['exa', 'Exa'],
+	['serper', 'Serper'], ['brave', 'Brave'], ['searxng', 'SearXNG']];
+var FETCH_FMTS = [['auto', 'auto (provider order)'], ['jina', 'Jina Reader'], ['firecrawl', 'Firecrawl']];
+var TTS_FMTS = [['openai', 'OpenAI-compatible (/v1/audio/speech passthrough)'],
+	['elevenlabs', 'ElevenLabs (translated)']];
 
 return view.extend({
 	load: function() {
@@ -72,28 +86,75 @@ return view.extend({
 		return Promise.all([
 			uci.load('aigate'),
 			fs.read_direct('/usr/share/aigate/providers.json', 'text')
-				.then(function(raw) { return JSON.parse(raw).providers || {}; })
-				.catch(function() { return {}; })
-		]).then(function(r) { return { sec: m ? m[1] : null, presets: r[1] }; });
+				.then(function(raw) {
+					var d = JSON.parse(raw);
+					return { p: d.providers || {}, m: d.media || {} };
+				})
+				.catch(function() { return { p: {}, m: {} }; })
+		]).then(function(r) {
+			return { sec: m ? m[1] : null, presets: r[1].p, media: r[1].m };
+		});
 	},
 
-	render: function(name) {
+	render: function(a, b) {
 		var self = this;
+		// LuCI conventions differ: render(data) or render(name, data)
+		var data = (b != null) ? b : ((a != null && typeof a === 'object') ? a : null);
+		var name = (data && data.sec != null) ? data.sec
+			: ((typeof a === 'string') ? a : null);
+		if (data) { PRESETS = data.presets || {}; MEDIA = data.media || {}; }
 		var sec = name ? uci.get('aigate', name) : {};
 		sec = sec || {};
 
 		var nameEl = E('input', { 'class': 't', 'type': 'text', 'value': name || '' });
 		if (!PRESETS['custom']) PRESETS['custom'] = null;
+		var presetKeys = Object.keys(PRESETS);
+		var presetOpts = presetKeys.map(function(k) {
+			return E('option', { 'value': 'c:' + k }, 'chat: ' + k);
+		});
+		// media presets as "search:tavily" etc.
+		['search', 'fetch', 'tts'].forEach(function(kind) {
+			var g = MEDIA[kind] || {};
+			Object.keys(g).forEach(function(k) {
+				presetOpts.push(E('option', { 'value': kind + ':' + k },
+					kind + ': ' + (g[k].display || k)));
+			});
+		});
+		var caps = { search: null, fetch: null, tts: null };
 		var presetEl = E('select', { 'class': 't', 'change': function() {
-				var p = PRESETS[this.value];
-				if (p) { typeEl.value = p.type; urlEl.value = p.url; }
-			} }, Object.keys(PRESETS).map(function(k) {
-				return E('option', { 'value': k }, k);
-			}));
+				var v = this.value;
+				if (v.indexOf('c:') === 0) {
+					var p = PRESETS[v.slice(2)];
+					if (p) { if (p.type) typeEl.value = p.type; urlEl.value = p.url; }
+					return;
+				}
+				var parts = v.split(':');   // kind:id
+				var g = MEDIA[parts[0]] || {};
+				var mp = g[parts[1]];
+				if (!mp) return;
+				urlEl.value = mp.url;
+				if (caps[parts[0]]) caps[parts[0]].checked = true;
+				if (parts[0] === 'search' && sec.searchFmtEl) sec.searchFmtEl.value = mp.format;
+				if (parts[0] === 'fetch' && sec.fetchFmtEl) sec.fetchFmtEl.value = mp.format;
+				if (parts[0] === 'tts' && sec.ttsFmtEl) sec.ttsFmtEl.value = mp.format;
+			} }, presetOpts);
 		var embEl = E('input', { 'type': 'checkbox',
 			'checked': sec.embeddings === '1' ? 'checked' : null });
 		var imgEl = E('input', { 'type': 'checkbox',
 			'checked': sec.images === '1' ? 'checked' : null });
+		var sttEl = E('input', { 'type': 'checkbox',
+			'checked': sec.stt === '1' ? 'checked' : null });
+		var ttsEl = E('input', { 'type': 'checkbox',
+			'checked': sec.tts === '1' ? 'checked' : null });
+		var searchEl = E('input', { 'type': 'checkbox',
+			'checked': sec.search === '1' ? 'checked' : null });
+		var fetchEl = E('input', { 'type': 'checkbox',
+			'checked': sec.fetch === '1' ? 'checked': null });
+		var searchFmtEl = fmtSelect(SEARCH_FMTS, sec.search_format);
+		var fetchFmtEl = fmtSelect(FETCH_FMTS, sec.fetch_format);
+		var ttsFmtEl = fmtSelect(TTS_FMTS, sec.tts_format || 'openai');
+		sec.searchFmtEl = searchFmtEl; sec.fetchFmtEl = fetchFmtEl; sec.ttsFmtEl = ttsFmtEl;
+		caps.search = searchEl; caps.fetch = fetchEl; caps.tts = ttsEl;
 		var typeEl = E('select', { 'class': 't' }, [
 			E('option', { 'value': 'anthropic', 'selected': sec.type === 'anthropic' ? 'selected' : null },
 				'anthropic — Claude-style API (/messages)'),
@@ -136,9 +197,22 @@ return view.extend({
 				E('label', { 'class': 'f' }, 'Capabilities of this provider'),
 				E('label', {}, [ embEl, ' embeddings (/v1/embeddings)' ]),
 				E('label', {}, [ imgEl, ' image generation (/v1/images/generations)' ]),
+				E('label', {}, [ ttsEl, ' text-to-speech (/v1/audio/speech)' ]),
+				E('label', {}, [ sttEl, ' speech-to-text (/v1/audio/transcriptions)' ]),
+				E('label', {}, [ searchEl, ' web search (/v1/search)' ]),
+				E('label', {}, [ fetchEl, ' web fetch (/v1/web/fetch)' ]),
+				E('label', { 'class': 'f' }, 'Search format'),
+				searchFmtEl,
+				E('label', { 'class': 'f' }, 'Web-fetch format'),
+				fetchFmtEl,
+				E('label', { 'class': 'f' }, 'TTS format'),
+				ttsFmtEl,
 				E('div', { 'style': 'margin-top:16px' }, [
 					E('button', { 'class': 'btn', 'click': ui.createHandlerFn(self, 'handleSave',
-						name, nameEl, typeEl, urlEl, modelsEl, headersEl, embEl, imgEl) }, 'Save'),
+						name, nameEl, typeEl, urlEl, modelsEl, headersEl,
+						{ emb: embEl, img: imgEl, tts: ttsEl, stt: sttEl,
+						  search: searchEl, fetch: fetchEl,
+						  searchFmt: searchFmtEl, fetchFmt: fetchFmtEl, ttsFmt: ttsFmtEl }) }, 'Save'),
 					E('button', { 'class': 'btn btn-secondary', 'click': function() {
 						window.location.href = L.url('admin/ai/aigate/providers');
 					} }, 'Back')
@@ -147,7 +221,7 @@ return view.extend({
 		]) ]);
 	},
 
-	handleSave: function(oldName, nameEl, typeEl, urlEl, modelsEl, headersEl, embEl, imgEl) {
+	handleSave: function(oldName, nameEl, typeEl, urlEl, modelsEl, headersEl, c) {
 		var name = nameEl.value.trim().replace(/[^A-Za-z0-9_]/g, '');
 		if (!name) { ui.addNotification(E('p', {}, 'Name is required.')); return; }
 		var chain = Promise.resolve();
@@ -160,8 +234,15 @@ return view.extend({
 			uci.set('aigate', name, 'base_url', urlEl.value.trim());
 			uci.set('aigate', name, 'models', modelsEl.value.trim());
 			uci.set('aigate', name, 'headers', headersEl.value.trim());
-			uci.set('aigate', name, 'embeddings', embEl.checked ? '1' : '0');
-			uci.set('aigate', name, 'images', imgEl.checked ? '1' : '0');
+			uci.set('aigate', name, 'embeddings', c.emb.checked ? '1' : '0');
+			uci.set('aigate', name, 'images', c.img.checked ? '1' : '0');
+			uci.set('aigate', name, 'tts', c.tts.checked ? '1' : '0');
+			uci.set('aigate', name, 'stt', c.stt.checked ? '1' : '0');
+			uci.set('aigate', name, 'search', c.search.checked ? '1' : '0');
+			uci.set('aigate', name, 'fetch', c.fetch.checked ? '1' : '0');
+			uci.set('aigate', name, 'search_format', c.searchFmt.value);
+			uci.set('aigate', name, 'fetch_format', c.fetchFmt.value);
+			uci.set('aigate', name, 'tts_format', c.ttsFmt.value);
 			return uci.save().then(function() { return uci.commit('aigate'); });
 		}).then(function() {
 			window.location.href = L.url('admin/ai/aigate/providers');

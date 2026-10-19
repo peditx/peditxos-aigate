@@ -1,5 +1,21 @@
 {
  "_generated": "from decolua/9router open-sse registry — do not edit, run scripts/sync-providers.sh",
+ "media": {
+  "search": {
+   "tavily": { "url": "https://api.tavily.com", "display": "Tavily", "format": "tavily" },
+   "exa": { "url": "https://api.exa.ai", "display": "Exa", "format": "exa" },
+   "serper": { "url": "https://google.serper.dev", "display": "Serper", "format": "serper" },
+   "brave": { "url": "https://api.search.brave.com", "display": "Brave Search", "format": "brave" },
+   "searxng": { "url": "https://searx.be", "display": "SearXNG (public instance)", "format": "searxng" }
+  },
+  "fetch": {
+   "jina": { "url": "https://r.jina.ai", "display": "Jina Reader", "format": "jina" },
+   "firecrawl": { "url": "https://api.firecrawl.dev/v1", "display": "Firecrawl", "format": "firecrawl" }
+  },
+  "tts": {
+   "elevenlabs": { "url": "https://api.elevenlabs.io/v1", "display": "ElevenLabs", "format": "elevenlabs" }
+  }
+ },
  "providers": {
   "agnes": {
    "type": "openai",
